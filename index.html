@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Smart Health Monitor</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-container">
+    <header>
+      <h1>💓 Smart Health Monitor</h1>
+      <button id="connect-btn">🔗 Connect Wristband</button>
+    </header>
+
+    <section class="status-section">
+      <p id="status-text">Not Connected</p>
+    </section>
+
+    <section class="metrics">
+      <div class="metric-card heart">
+        <h2>Heart Rate</h2>
+        <p id="heart-rate">-- bpm</p>
+        <button class="refresh-btn" onclick="manualCheck()">🔄 Check Now</button>
+      </div>
+      <div class="metric-card oxygen">
+        <h2>SpO₂ Level</h2>
+        <p id="oxygen-level">-- %</p>
+        <button class="refresh-btn" onclick="manualCheck()">🔄 Check Now</button>
+      </div>
+    </section>
+
+    <section class="contacts-section">
+      <h2>🆘 Emergency Contacts</h2>
+      <form id="contact-form">
+        <input type="text" id="name" placeholder="Name" required />
+        <input type="tel" id="phone" placeholder="Phone Number" required />
+        <button type="submit">Add Contact</button>
+      </form>
+      <ul id="contact-list"></ul>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
