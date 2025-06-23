@@ -1,0 +1,183 @@
+## Main.py
+
+from fastapi import FastAPI, File, UploadFile, UploadFile, HTTPException
+from funcs import generate_hash,extract_text,embed_text,split_text,save_vectors
+from database import create_tables, get_session, pdf_table
+import io
+
+file_like = io.BytesIO(file_bytes)
+app=FastAPI()
+
+
+sess=get_session()
+@app.post("/upload/")
+async def upload_file(files: list[UploadFile] = File(...)):
+    for file in files:
+        file_bytes = await file.read()
+        file_like = io.BytesIO(file_bytes)
+        file_like.seek(0)
+        file_hash = generate_hash(file_like)
+
+        result = sess.execute(pdf_table.select().where(pdf_table.c.hash == file_hash)).fetchone()
+
+        if result:
+            raise HTTPException(status_code=400, detail="File already exists")
+        
+        sess.execute(pdf_table.insert().values(filename=file.filename, hash=file_hash))
+        sess.commit()
+
+        file_like.seek(0)
+        text = extract_text(file_like)
+        chunks=split_text(text)
+        embedding=embed_text(chunks)
+        vectordb=save_vectors(embedding,chunks)
+
+
+
+
+
+
+
+
+
+
+
+
+## db.py
+
+from sqlalchemy import create_engine, MetaData, Table, Column, String, Integer
+from sqlalchemy.orm import sessionmaker
+
+
+DATABASE_URL = "sqlite:///./pdf_files.db"
+engine = create_engine(DATABASE_URL)
+metadata = MetaData()
+
+
+pdf_table = Table(
+    "pdf_files", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("filename", String, nullable=False),
+    Column("hash", String, unique=True, nullable=False)
+)
+
+
+def create_tables():
+    metadata.create_all(engine)
+
+
+def get_session():
+    Session = sessionmaker(bind=engine)
+    return Session()
+
+def list_files():
+    from sqlalchemy import select
+
+def list_all_files(session=get_session()):
+    result = session.execute(select(pdf_table.c.id, pdf_table.c.filename, pdf_table.c.hash)).fetchall()
+    
+    if not result:
+        print("No files found in the database.")
+        return
+    
+    print("Stored PDF Files:")
+    for row in result:
+        print(f"ID: {row.id}, Filename: {row.filename}, Hash: {row.hash}")
+
+
+
+
+
+
+
+
+
+
+## funcsec
+
+import hashlib
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+
+client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory="./chromadb_data"))
+collection = client.get_or_create_collection(name="pdf_chunks")
+
+def generate_hash(file, chunk_size=8192) -> str:
+    hasher = hashlib.sha256()
+    file.seek(0) 
+    chunk = file.read(chunk_size) 
+    while chunk:
+        hasher.update(chunk)      
+        chunk = file.read(chunk_size) 
+    file.seek(0) 
+    return hasher.hexdigest()
+
+
+def extract_text(file):
+    with pdfplumber.open(file) as pdf:
+        full_text = ""
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text
+    return full_text
+
+
+def split_text(text, chunk_size=1000, chunk_overlap=200):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
+    return splitter.split_text(text)
+
+def embed_text(chunks):
+    embeddings = []
+    for chunk in chunks:
+        response = genai.embedding.create(input=chunk, model="models/embedding-001")
+        emb = response.data[0].embedding
+        embeddings.append(emb)
+    return embeddings
+
+def save_vectors(embedding,chunks):
+    ids = [f"{file_hash}_{i}" for i in range(len(chunks))]
+    metadatas = [{"file_hash": file_hash} for _ in chunks]
+    collection.add(ids=ids, embeddings=embedding, metadatas=metadatas, documents=chunks)
+
+
+def delete_vectors_by_file_hash(file_hash):
+    collection.delete(where={"file_hash": file_hash})
+
+
+
+
+
+
+
+
+## app
+
+import streamlit as st
+import requests
+
+API_URL = "http://localhost:8000"
+
+st.title("Upload PDF Files")
+
+uploaded_files = st.file_uploader("Drop the files here", type="pdf", accept_multiple_files=True, key="file_uploader")
+
+if uploaded_files:
+    for file in uploaded_files:
+        files = [("files", (file.name, file.read(), "application/pdf"))]
+
+        with st.spinner("Processing..."):
+            res = requests.post(f"{API_URL}/upload/", files=files)
+
+            if res.status_code == 200:
+                st.success(f"{file.name} uploaded and processed.")
+            else:
+                st.error(f"Failed to upload {file.name}")
+
+
+
+
+
