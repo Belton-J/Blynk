@@ -1,0 +1,352 @@
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from funcs import (
+    generate_hash, extract_text, embed_text,
+    split_text, save_vectors, delete_vectors,get_answer
+)
+from sql import create_tables, get_session, pdf_table, list_files
+import io
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+create_tables()
+
+
+@app.post("/upload/")
+async def upload_file(files: list[UploadFile] = File(...)):
+    for file in files:
+        file_bytes = await file.read()
+        file_like = io.BytesIO(file_bytes)
+        file_like.seek(0)
+
+        file_hash = generate_hash(file_like)
+
+
+        session = get_session()
+        try:
+            result = session.execute(
+                pdf_table.select().where(pdf_table.c.hash == file_hash)
+            ).fetchone()
+
+            if result:
+                raise HTTPException(status_code=400, detail="File already exists")
+            
+            session.execute(pdf_table.insert().values(filename=file.filename, hash=file_hash))
+            session.commit()
+        finally:
+            session.close()
+
+
+        file_like.seek(0)
+        text = extract_text(file_like)
+        chunks = split_text(text)
+        embeddings = embed_text(chunks)
+        save_vectors(embeddings, chunks, file_hash)  
+
+
+@app.get("/files")
+def get_files():
+    return list_files()
+
+
+@app.put("/delete/{file_hash}")
+def delete_file(file_hash: str):
+    session = get_session()
+    try:
+        result = session.execute(
+            pdf_table.select().where(pdf_table.c.hash == file_hash)
+        ).fetchone()
+
+        if not result:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        session.execute(pdf_table.delete().where(pdf_table.c.hash == file_hash))
+        session.commit()
+
+        delete_vectors(file_hash)
+
+        return {"message": "File and associated vectors deleted"}
+
+    finally:
+        session.close()
+
+
+
+@app.get("/get/answers/{question}")
+async def get_ans(question: str):
+    answer = get_answer(question)
+    return JSONResponse(content={"answer": answer})
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from sqlalchemy import create_engine, MetaData, Table, Column, String, Integer, select
+from sqlalchemy.orm import sessionmaker
+
+
+DATABASE_URL = "sqlite:///./pdf_files.db"
+
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+metadata = MetaData()
+
+# Define the table
+pdf_table = Table(
+    "pdf_files", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("filename", String, nullable=False),
+    Column("hash", String, unique=True, nullable=False)
+)
+
+
+def create_tables():
+    metadata.create_all(engine)
+
+
+def get_session():
+    Session = sessionmaker(bind=engine)
+    return Session()
+
+# Return list of all files
+def list_files():
+    session = get_session()
+    try:
+        result = session.execute(
+            select(pdf_table.c.id, pdf_table.c.filename, pdf_table.c.hash)
+        ).fetchall()
+
+        return [
+            {"id": row.id, "filename": row.filename, "hash": row.hash}
+            for row in result
+        ]
+    finally:
+        session.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import hashlib
+import pdfplumber
+import chromadb
+import google.generativeai as genai
+from dotenv import load_dotenv
+import os
+
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from langchain.chains.question_answering import load_qa_chain
+from langchain_google_genai import (
+    GoogleGenerativeAIEmbeddings,
+    ChatGoogleGenerativeAI
+)
+
+
+load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY not found in .env")
+
+
+genai.configure(api_key=GOOGLE_API_KEY)
+client = chromadb.PersistentClient(path="./chromadb_data")
+collection_name = "pdf_chunks"
+collection = client.get_or_create_collection(name=collection_name)
+
+
+embedding_model = GoogleGenerativeAIEmbeddings(
+    model="models/embedding-001",
+    google_api_key=GOOGLE_API_KEY
+)
+
+
+def generate_hash(file, chunk_size=8192):
+    hasher = hashlib.sha256()
+    file.seek(0)
+    while chunk := file.read(chunk_size):
+        hasher.update(chunk)
+    file.seek(0)
+    return hasher.hexdigest()
+
+
+def extract_text(file):
+    with pdfplumber.open(file) as pdf:
+        return "".join(page.extract_text() or "" for page in pdf.pages)
+
+
+def split_text(text, chunk_size=1000, chunk_overlap=200):
+    splitter = CharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
+    return splitter.split_text(text)
+
+
+def embed_text(chunks):
+    return embedding_model.embed_documents(chunks)
+
+
+def save_vectors(embeddings, chunks, file_hash):
+    ids = [f"{file_hash}_{i}" for i in range(len(chunks))]
+    metadatas = [{"file_hash": file_hash} for _ in chunks]
+    collection.add(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
+
+
+def delete_vectors(file_hash):
+    collection.delete(where={"file_hash": file_hash})
+
+
+def get_qa_chain():
+    prompt = PromptTemplate(
+        template="""
+        Answer the question with the core points that gives the user a clear understanding about the concept they ask for,
+        from the provided context.
+        If the answer is not available in the context, say "Answer is not available in the context."
+        Do not make up answers.
+
+        Context:
+        {context}
+
+        Question:
+        {question}
+
+        Answer:""",
+        input_variables=["context", "question"]
+    )
+    model = ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        temperature=0.3,
+        google_api_key=GOOGLE_API_KEY
+    )
+    return load_qa_chain(model, chain_type="stuff", prompt=prompt)
+
+
+def get_answer(question):
+    vectordb = Chroma(
+        client=client,
+        collection_name=collection_name,
+        embedding_function=embedding_model
+    )
+
+    docs = vectordb.similarity_search(question, k=3)
+    if not docs:
+        return "Answer is not available in the context."
+
+    chain = get_qa_chain()
+    result = chain(
+        {"input_documents": docs, "question": question},
+        return_only_outputs=True
+    )
+    return result["output_text"]
+
+
+
+
+
+
+
+
+
+
+
+
+import streamlit as st
+import requests
+
+API_URL = "http://localhost:8000"
+
+st.set_page_config(layout="wide")
+st.title("📄 PDF RAG Assistant")
+
+
+st.sidebar.title("📂 Stored PDF Files")
+
+try:
+    with st.sidebar:
+        response = requests.get(f"{API_URL}/files")
+
+        if response.status_code == 200:
+            files = response.json()
+
+            if not files:
+                st.sidebar.info("No files uploaded yet.")
+            else:
+                for file in files:
+                    with st.sidebar.expander(file["filename"]):
+                        if st.button(f"🗑️ Delete", key=f"del_{file['hash']}"):
+                            with st.spinner(f"Deleting {file['filename']}..."):
+                                res = requests.put(f"{API_URL}/delete/{file['hash']}")
+                                if res.status_code == 200:
+                                    st.success(f"{file['filename']} deleted successfully.")
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to delete the file.")
+        else:
+            st.sidebar.error("Failed to fetch files from the server.")
+except requests.exceptions.ConnectionError:
+    st.sidebar.error("Backend not running. Please start the FastAPI server.")
+
+
+col1, col_space, col2 = st.columns([1.5, 0.2, 2])
+
+
+with col1:
+    st.subheader("📤 Upload PDF")
+    uploaded_files = st.file_uploader(
+        "Select PDF files",
+        type="pdf",
+        accept_multiple_files=True,
+        key="file_uploader"
+    )
+    if uploaded_files:
+        if st.button("Upload"):
+            for file in uploaded_files:
+                files = [("files", (file.name, file.read(), "application/pdf"))]
+
+                with st.spinner(f"Uploading {file.name}..."):
+                    res = requests.post(f"{API_URL}/upload/", files=files)
+
+                    if res.status_code == 200:
+                        st.success(f"{file.name} uploaded and processed.")
+                    else:
+                        st.error(f"Failed to upload {file.name}")
+
+
+with col2:
+    st.subheader("💬 Ask a Question")
+    question = st.text_input("Type your question here...")
+
+    if st.button("Send"):
+        with st.spinner("Sending your question..."):
+            response = requests.get(f"{API_URL}/get/answers/{question}")
+
+            if response.status_code == 200:
+                result = response.json()
+                st.success("✅ Success")
+                st.write("### 🤖 Answer:")
+                st.markdown(result["answer"])
+            else:
+                st.warning("⚠️ Failed to fetch answer.")
+
+               
+            
